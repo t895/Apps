@@ -1,5 +1,6 @@
 package app.grapheneos.apps.core
 
+import android.annotation.SuppressLint
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageInfo
 import android.content.pm.PackageInstaller
@@ -128,7 +129,7 @@ class InstallTask(
 
     private suspend fun obtainAndWriteApks(session: Session) {
         if (!params.isUpdate && maybeReuseAvailableApks(session)) {
-            // successfuly reused APKs from other user profile
+            // successfully reused APKs from other user profile
         } else {
             // If there was a cache pruning job running when this install task was created, await
             // for its completion to improve reliability of apk downloads. Creation of new pruning
@@ -143,7 +144,16 @@ class InstallTask(
                     }
                 }
 
-                if (rPackage.common.hasFsVeritySignatures) {
+                if (rPackage.hasV4Signatures) {
+                    apks.forEach { apk ->
+                        launch {
+                            val name = "${apk.name}.idsig"
+                            obtainAndWriteV4OrFsvSigSignature(name, name, session)
+                        }
+                    }
+                }
+
+                if (rPackage.common.hasFsvSigSignatures) {
                     val certId = rPackage.common.repo.fsVerityCertificateId
                     if (certId != null) {
                         apks.forEach { apk ->
@@ -151,7 +161,9 @@ class InstallTask(
                                 val downloadName = "${apk.name}.${certId}.fsv_sig"
                                 // OS requires this format for file name that is written into session
                                 val name = "${apk.name}.fsv_sig"
-                                obtainAndWriteFsVeritySig(downloadName, name, session)
+                                obtainAndWriteV4OrFsvSigSignature(downloadName, name, session,
+                                    // fsv_sig signatures are small (typically under 1K) and don't compress well
+                                    disableCompression = true)
                             }
                         }
                     }
@@ -173,12 +185,15 @@ class InstallTask(
     }
 
     private suspend fun maybeReuseAvailableApks(session: Session): Boolean {
-        val pkgInfo = findPackage(rPackage.packageName, rPackage.versionCode, rPackage.common.signatures)
+        val pkgInfo = findPackage(rPackage.packageName, rPackage.versionCode, rPackage.common.validCertDigests)
         if (pkgInfo == null) {
             return false
         }
 
         val appInfo = pkgInfo.applicationInfo
+        if (appInfo == null) {
+            return false
+        }
 
         coroutineScope {
             val splitSourceDirs = appInfo.splitSourceDirs ?: emptyArray<String>()
@@ -210,7 +225,7 @@ class InstallTask(
     // - don't reopen files unless it can't be avoided (file descriptor remains valid even if its
     // file is removed)
 
-    private fun openTempFileFd(tmpPath: String): ScopedFileDescriptor { // todo use common
+    private fun openTempFileFd(tmpPath: String): ScopedFileDescriptor {
         apksDir.mkdirs()
         // O_TRUNC to handle stale tmp files that may remain after process kill, power loss etc
         val flags = O_RDWR or O_CREAT or O_TRUNC
@@ -283,16 +298,16 @@ class InstallTask(
         }
     }
 
-    private suspend fun obtainAndWriteFsVeritySig(downloadName: String, name: String, session: Session) {
+    private suspend fun obtainAndWriteV4OrFsvSigSignature(downloadName: String, name: String, session: Session, disableCompression: Boolean = false) {
         val file = File(apksDir, downloadName)
         val path = file.path
 
-        // fs-verity signatures are small (typically under 1K) and don't compress well, so don't
-        // support download resume and compression
+        // v4 and fsv_sig signatures are usually small, skip download resume support for simplicity
 
-        // fs-verity signatures don't have SHA-256 checksums:
-        // kernel enforces that signatures are valid and come from a trusted certificate that is
-        // stored in the immutable system image
+        // v4 and fsv_sig signatures don't have SHA-256 checksums:
+        // - v4 signatures are verified against the corresponding APKs by the OS before installation
+        // - for fsv_sig signatures, kernel enforces that they are valid and come from a trusted
+        // certificate that is stored in the immutable system image
 
         // Check whether this signature is already downloaded
         try {
@@ -319,7 +334,9 @@ class InstallTask(
                 val url = "$REPO_BASE_URL/packages/${rPackage.manifestPackageName}/${rPackage.versionCode}/$downloadName"
 
                 openConnection(params.network, url) {
-                    setRequestProperty("Accept-Encoding", "identity")
+                    if (disableCompression) {
+                        setRequestProperty("Accept-Encoding", "identity")
+                    }
                 }.use { conn ->
                     job.ensureActive()
 
@@ -366,18 +383,37 @@ class InstallTask(
 
             lseekToStart(uncompressedFd.v)
 
-            // enforce that packages that declare that they don't have code declare it in their
-            // AndroidManifest too. OS won't run any code from packages that have hasCode="false"
-            // directive in their manifest
-            if (apk.pkg.common.noCode) {
+            if (apk.pkg.common.noCode || apk.pkg.common.isSharedLibrary) {
                 // see dupToPfd comment to see why dup is even needed
                 uncompressedFd.dupToPfd().use {
                     // there's no public variant of getPackageArchiveInfo() that accepts a file descriptor
                     val pkgInfo = pkgManager.getPackageArchiveInfo("/proc/self/fd/${it.getFd()}", 0L)!!
-                    if ((pkgInfo.applicationInfo.flags and ApplicationInfo.FLAG_HAS_CODE) != 0) {
-                        throw GeneralSecurityException("${apk.pkg.packageName}: ${apk.name} should have " +
+
+                    // enforce that packages that declare that they don't have code declare it in their
+                    // AndroidManifest too. OS won't run any code from packages that have hasCode="false"
+                    // directive in their manifest
+                    if (apk.pkg.common.noCode) {
+                        val appInfo = pkgInfo.applicationInfo
+                        if (appInfo == null || (appInfo.flags and ApplicationInfo.FLAG_HAS_CODE) != 0) {
+                            throw GeneralSecurityException("${apk.pkg.packageName}: ${apk.name} should have " +
                                     "hasCode=\"false\" attribute in its AndroidManifest")
+                        }
                     }
+
+                    // don't allow abusing isSharedLibrary property to bypass app install confirmation
+                    // requirement
+                    if (apk.pkg.common.isSharedLibrary) {
+                        // there's no equivalent public API as of SDK 34
+                        @SuppressLint("DiscouragedPrivateApi")
+                        val privateFlagsField = ApplicationInfo::class.java.getDeclaredField("privateFlags")
+                        val privateFlags = privateFlagsField.get(pkgInfo.applicationInfo) as Int
+                        val PRIVATE_FLAG_STATIC_SHARED_LIBRARY = 1 shl 14
+                        if ((privateFlags and PRIVATE_FLAG_STATIC_SHARED_LIBRARY) == 0) {
+                            throw GeneralSecurityException("${apk.pkg.packageName}: " +
+                                    "${apk.name} is not a static shared library")
+                        }
+                    }
+
                 }
                 lseekToStart(uncompressedFd.v)
             }
@@ -433,6 +469,9 @@ class InstallTask(
 
             if (Build.VERSION.SDK_INT >= 34) {
                 setApplicationEnabledSettingPersistent()
+                if (rPackage.common.requestUpdateOwnership) {
+                    setRequestUpdateOwnership(true)
+                }
             }
 
             setSize(apks.sumOf { it.size })
@@ -513,8 +552,8 @@ class InstallTask(
         }
 
         // Ask the PackageManager to return APKs for this package if it's already installed on this device
-        // by another user, its version is >= the requested version, and its signature hashes match
-        fun findPackage(packageName: String, minVersion: Long, signatures: Array<ByteArray>): PackageInfo? {
+        // by another user, its version is >= the requested version, and its cert digests match
+        fun findPackage(packageName: String, minVersion: Long, validCertDigests: Array<ByteArray>): PackageInfo? {
             if (!isPrivilegedInstaller) {
                 return null
             }
@@ -533,11 +572,11 @@ class InstallTask(
                 return null
             }
 
-            val sigBundle = Bundle()
-            sigBundle.putInt("len", signatures.size)
-            signatures.forEachIndexed { i, arr -> sigBundle.putByteArray(i.toString(), arr) }
+            val certDigestBundle = Bundle()
+            certDigestBundle.putInt("len", validCertDigests.size)
+            validCertDigests.forEachIndexed { i, arr -> certDigestBundle.putByteArray(i.toString(), arr) }
 
-            return method.invoke(pkgManager, packageName, minVersion, sigBundle) as PackageInfo?
+            return method.invoke(pkgManager, packageName, minVersion, certDigestBundle) as PackageInfo?
         }
     }
 }

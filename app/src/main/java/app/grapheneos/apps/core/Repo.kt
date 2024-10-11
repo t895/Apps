@@ -1,6 +1,7 @@
 package app.grapheneos.apps.core
 
 import android.content.pm.ApplicationInfo
+import android.content.pm.FeatureInfo
 import android.content.res.Configuration
 import android.os.Build
 import android.os.LocaleList
@@ -23,9 +24,11 @@ import app.grapheneos.apps.util.asStringList
 import app.grapheneos.apps.util.checkMainThread
 import app.grapheneos.apps.util.getPackageInfoOrNull
 import app.grapheneos.apps.util.isEven
+import app.grapheneos.apps.util.maybeGetSystemFeatureInfo
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.security.cert.CertificateFactory
@@ -53,7 +56,7 @@ class Repo(json: JSONObject, val eTag: String, val isDummy: Boolean = false) {
 
             if (originalPackage != null) {
                 pkgManager.getPackageInfoOrNull(originalPackage)?.let {
-                    if (it.applicationInfo.flags and ApplicationInfo.FLAG_SYSTEM != 0) {
+                    if (it.applicationInfo?.flags ?: 0 and ApplicationInfo.FLAG_SYSTEM != 0) {
                         renamedPackages.put(manifestPackageName, originalPackage)
                     }
                 }
@@ -91,6 +94,11 @@ class Repo(json: JSONObject, val eTag: String, val isDummy: Boolean = false) {
     }
 
     val fsVerityCertificateId: Int? = run {
+        if (Build.VERSION.SDK_INT >= 35) {
+            // fs-verity certificates are not used by the OS since SDK 35
+            return@run null
+        }
+
         if (!isPrivilegedInstaller) {
             if (!pkgManager.canRequestPackageInstalls()) {
                 // isAppSourceCertificateTrusted() below requires {REQUEST_,}INSTALL_PACKAGES
@@ -124,13 +132,14 @@ enum class ReleaseChannel(@StringRes val uiName: Int) {
 }
 
 fun findRPackage(variants: List<RPackage>, channel: ReleaseChannel): RPackage {
-    // variants are sorted by stability in descending order
+    // variants are sorted by stability in ascending order (from least stable to most stable)
     return variants.find { it.releaseChannel >= channel } ?: variants.last()
 }
 
 enum class PackageSource(@StringRes val uiName: Int) {
     GrapheneOS(R.string.pkg_source_grapheneos),
     GrapheneOS_build(R.string.pkg_source_grapheneos_build),
+    Mirror(R.string.pkg_source_mirror),
     Google(R.string.pkg_source_google),
 }
 
@@ -140,7 +149,7 @@ class RPackageGroup(val name: String) {
 }
 
 // Contains properties that are common to variants of the package, and the list of variants.
-// Some of the comman properties can be overriden in its variants
+// Some of the common properties can be overridden in its variants
 class RPackageContainer(val repo: Repo, val packageName: String,
                         // different from packageName if renamed via the original-package system
                         val manifestPackageName: String,
@@ -169,8 +178,9 @@ class RPackageContainer(val repo: Repo, val packageName: String,
             repo.translateManifestPackageName(it)
         } ?: emptyList()
 
-    // SHA-256 of known signatures
-    val signatures: Array<ByteArray> = json.getJSONArray("signatures").asStringList().map {
+    // SHA-256 digests of valid signing certificates
+    val validCertDigests: Array<ByteArray> =
+            json.getJSONArray("signatures" /* historical name */).asStringList().map {
         val arr = hexStringToByteArray(it)
         check(arr.size == (256 / 8))
         arr
@@ -200,7 +210,7 @@ class RPackageContainer(val repo: Repo, val packageName: String,
     val dependencies: Array<Dependency>? = parseDependencies(json, repo)
 
     val variants: List<RPackage> = json.getJSONObject("variants").let {
-        val pkgs = arrayOfNulls<RPackage>(ReleaseChannel.values().size)
+        val pkgs = arrayOfNulls<RPackage>(ReleaseChannel.entries.size)
 
         for (versionString in it.keys()) {
             val jo = it.getJSONObject(versionString)
@@ -245,7 +255,18 @@ class RPackageContainer(val repo: Repo, val packageName: String,
         return@let pkgs.filterNotNull()
     }
 
-    val hasFsVeritySignatures = json.optBoolean("hasFsVeritySignatures", false)
+    val hasFsvSigSignatures = if (Build.VERSION.SDK_INT >= 35) {
+        // fsv_sig are not used by the OS since SDK 35, v4 APK signatures are used instead
+        false
+    } else {
+        json.optBoolean("hasFsVeritySignatures", false)
+    }
+
+    val requestUpdateOwnership = json.optBoolean("requestUpdateOwnership", true)
+
+    // Opt out of bulk updates that are performed by the auto-update job and by the "Update all"
+    // button. This option is intended for packages that are able to self-update, such as app stores.
+    val optOutOfBulkUpdates = json.optBoolean("optOutOfBulkUpdates", false)
 
     fun getPackage(channel: ReleaseChannel): RPackage {
         return findRPackage(variants, channel)
@@ -255,7 +276,7 @@ class RPackageContainer(val repo: Repo, val packageName: String,
 private val emptyDependencyArray = emptyArray<Dependency>()
 
 private fun parseDependencies(json: JSONObject, repo: Repo): Array<Dependency>? {
-    val arr = json.optJSONArray("deps")
+    val arr: JSONArray? = json.optJSONArray("deps2") ?: json.optJSONArray("deps")
     return if (arr != null) {
         arr.asStringList().map { Dependency(it, repo) }.toTypedArray()
     } else {
@@ -304,6 +325,15 @@ class RPackage(val common: RPackageContainer, val versionCode: Long, repo: Repo,
             list.add(apk)
         }
         list
+    }
+
+    val hasV4Signatures = if (Build.VERSION.SDK_INT >= 35) {
+        // v4 signatures are used by the OS to enable fs-verity for APKs
+        json.optBoolean("hasV4Signatures", false)
+    } else {
+        // v4 signatures are supported since SDK 30, but before SDK 35 they were used only for
+        // IncFS-backed APK streaming, which isn't used by this installer
+        false
     }
 
     fun collectNeededApks(config: Configuration): List<Apk> {
@@ -397,7 +427,7 @@ class RPackage(val common: RPackageContainer, val versionCode: Long, repo: Repo,
                 val list = try {
                     localeManager.getApplicationLocales(packageName)
                 } catch (e: Exception) {
-                    // getApplicationLocales() is allowed only we are currently the
+                    // getApplicationLocales() is allowed only if we are currently the
                     // installer-of-record for this package. It also could have been racily
                     // uninstalled, which results in an IllegalArgumentException
                     LocaleList.getEmptyLocaleList()
@@ -445,7 +475,7 @@ class Apk(
 
             if (qualifier.endsWith("dpi")) {
                 Type.DENSITY
-            } else if (Abi.values().any { it.apkSplitQualifier == qualifier }) {
+            } else if (Abi.entries.any { it.apkSplitQualifier == qualifier }) {
                 Type.ABI
             } else {
                 Type.LANGUAGE
@@ -473,57 +503,86 @@ class Apk(
 private val deviceAbi: Apk.Abi = run {
     // Intentionally don't support secondary ABIs. They are expected to work worse than the primary ABI.
     val osName: String = Build.SUPPORTED_ABIS.first()
-    Apk.Abi.values().first { it.osName == osName }
+    Apk.Abi.entries.first { it.osName == osName }
 }
 
 // Used only for static deps. If it was used for dynamic deps, dependency resolution would become
 // too complex, especially during package updates.
-private class ComplexDependency(string: String, repo: Repo) {
-    val packageName: String
+private class ComplexDependency(string: String) {
+    val lhs: String // left-hand-side
     val op: String
     val version: Long
 
     init {
         val tokens = string.split(" ")
-        val manifestPackageName = tokens[0]
-        packageName = repo.translateManifestPackageName(manifestPackageName)
+        lhs = tokens[0]
         if (tokens.size == 1) {
             op = ">="
             version = 0
         } else {
-            kotlin.check(tokens.size == 3)
+            check(tokens.size == 3)
             op = tokens[1]
             version = tokens[2].toLong()
         }
     }
 
-    fun check(enforceSystemPkg: Boolean = false): Boolean {
-        val pi = pkgManager.getPackageInfoOrNull(packageName) ?: return false
-        if (!pi.applicationInfo.enabled) {
-            return false
-        }
-        if (enforceSystemPkg) {
-            if (pi.applicationInfo.flags and ApplicationInfo.FLAG_SYSTEM == 0) {
-                return false
-            }
-        }
-        val installedVersion = pi.longVersionCode
-
+    fun check(presentVersion: Long): Boolean {
         return when (op) {
-            ">=" -> installedVersion >= version
-            "==" -> installedVersion == version
-            "<" -> installedVersion < version
+            ">=" -> presentVersion >= version
+            "==" -> presentVersion == version
+            "<" -> presentVersion < version
             else -> throw IllegalStateException(op)
         }
     }
 }
 
 private fun checkStaticDeps(json: JSONObject, repo: Repo): Boolean {
-    val arr = json.optJSONArray("staticDeps")?.asStringList() ?: return true
-
-    return arr.all {
-        ComplexDependency(it, repo).check(enforceSystemPkg = true)
+    json.optJSONArray("supportedDevices")?.asStringList()?.let { devices ->
+        if (!devices.contains(Build.DEVICE)) {
+            return false
+        }
     }
+
+    json.optJSONArray("requiredSystemFeatures")?.asStringList()?.let { features ->
+        if (features.any { !checkSystemFeatureDep(ComplexDependency(it)) }) {
+            return false
+        }
+    }
+
+    json.optJSONArray("staticDeps")?.asStringList()?.let { pkgDeps ->
+        for (depStr in pkgDeps) {
+            val dep = ComplexDependency(depStr)
+            // there's currently no certificate checks for static dependencies, require them to
+            // be a system package instead, unless it's our own package
+            val enforceSystemPkg = dep.lhs != selfPkgName
+            if (!checkPackageDep(dep, repo, enforceSystemPkg)) {
+                return false
+            }
+        }
+    }
+
+    return true
+}
+
+private fun checkSystemFeatureDep(dep: ComplexDependency): Boolean {
+    val featureInfo: FeatureInfo = maybeGetSystemFeatureInfo(dep.lhs) ?: return false
+    return dep.check(featureInfo.version.toLong())
+}
+
+private fun checkPackageDep(dep: ComplexDependency, repo: Repo, enforceSystemPkg: Boolean = false): Boolean {
+    val manifestPackageName = dep.lhs
+    val packageName = repo.translateManifestPackageName(manifestPackageName)
+    val pi = pkgManager.getPackageInfoOrNull(packageName) ?: return false
+    val appInfo = pi.applicationInfo ?: return false
+    if (!appInfo.enabled) {
+        return false
+    }
+    if (enforceSystemPkg) {
+        if (appInfo.flags and ApplicationInfo.FLAG_SYSTEM == 0) {
+            return false
+        }
+    }
+    return dep.check(pi.longVersionCode)
 }
 
 private fun hexStringToByteArray(s: String): ByteArray {

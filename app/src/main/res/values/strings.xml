@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Apps</string>
+    <string name="app_name">App Store</string>
 
     <string name="pkg_status_disabled">Disabled</string>
     <string name="pkg_status_update_available">Update available (%1$s)</string>
@@ -31,8 +31,9 @@
     <string name="pkg_dependencies">Dependencies</string>
 
     <string name="pkg_source_grapheneos">GrapheneOS</string>
-    <string name="pkg_source_google">Google (mirror)</string>
     <string name="pkg_source_grapheneos_build">GrapheneOS build</string>
+    <string name="pkg_source_mirror">Mirror</string>
+    <string name="pkg_source_google">Google (mirror)</string>
 
     <string name="settings">Settings</string>
     <string name="open_settings">Open settings</string>
@@ -98,6 +99,8 @@
     <string name="notif_download_failed">Download failed</string>
 
     <string name="unable_to_fetch_app_list">Unable to fetch the list of apps</string>
+    <string name="app_update_check_failed">App update check failed</string>
+
     <string name="main_screen_unable_to_fetch_app_list_initial">Unable to fetch the list of apps, swipe down to try again.</string>
 
     <string name="uninstall_failed">Uninstall failed</string>
